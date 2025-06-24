@@ -92,9 +92,9 @@ void process_data(void *parameters)
 
     float humidity = 0.0;
     Presence_sensor sensor_data;
-    int total_humidity = 0;
-    const int MAX_HUMIDITY_VALUES = 50;
-    queue<int> humidity_values;
+    float total_humidity = 0;
+    const float MAX_HUMIDITY_VALUES = 50;
+    queue<float> humidity_values;
     xSemaphoreTake(serial_mutex, portMAX_DELAY);
     Serial.println("------Process Data Task Started------");
     xSemaphoreGive(serial_mutex);
@@ -117,7 +117,7 @@ void process_data(void *parameters)
         if (humidity_values.size() == MAX_HUMIDITY_VALUES)
         {
             xSemaphoreTake(serial_mutex, portMAX_DELAY);
-            Serial.printf("Total Humidity %d - Current Humidity: %f\n", (total_humidity / MAX_HUMIDITY_VALUES), humidity);
+            Serial.printf("Total Humidity %.2f - Current Humidity: %.2f\n", (total_humidity / MAX_HUMIDITY_VALUES), humidity);
             xSemaphoreGive(serial_mutex);
             if (humidity > (total_humidity / MAX_HUMIDITY_VALUES) * 1.06)
             {
@@ -143,11 +143,11 @@ void process_data(void *parameters)
                 xSemaphoreTake(send_mqtt, 0);
 
                 total_humidity = 0;
-                while (!humidity_values.empty())
-                {
-                    humidity_values.pop();
-                }
-                vTaskDelay(500 / portTICK_PERIOD_MS);
+                // while (!humidity_values.empty())
+                // {
+                //     humidity_values.pop();
+                // }
+                // vTaskDelay(500 / portTICK_PERIOD_MS);
             }
 
             total_humidity -= humidity_values.front();
@@ -314,6 +314,8 @@ void VerificaConexoesWiFIEMQTT(void)
  */
 void mqtt_task(void *parameters)
 {
+    
+
     for (;;)
     {
         VerificaConexoesWiFIEMQTT();
@@ -325,32 +327,38 @@ void mqtt_task(void *parameters)
         Serial.println("------ Send to MQTT ------");
         xSemaphoreGive(serial_mutex);
 
-        MQTT.publish(TOPIC_PUBLISH_DISTANCE, "start:");
+        char json_payload[2048]; // Aumente o tamanho se necessário
+        strcpy(json_payload, "{\"readings\":[");
 
         float distance = 0;
-        for (int i = 0; i < 180 && xQueueReceive(distance_queue, &distance, 0) == pdTRUE; i++) //
-        {
-            char msg[50];
-            snprintf(msg, 50, "%.2f", distance);
-            MQTT.publish(TOPIC_PUBLISH_DISTANCE, msg);
-            vTaskDelay(50 / portTICK_PERIOD_MS); // Small delay to prevent flooding
-        }
-        MQTT.publish(TOPIC_PUBLISH_DISTANCE, "end");
-        // xSemaphoreGive(send_mqtt);
-
-        // // Publish angle data (non-blocking)
-        // xSemaphoreTake(send_mqtt, portMAX_DELAY);
-        MQTT.publish(TOPIC_PUBLISH_ANGLE, "start");
-
         int angle = 0;
-        for (int i = 0; i < 180 && xQueueReceive(servo_angle_queue, &angle, 0) == pdTRUE; i++) // Timeout 0 = non-blocking
+        bool first = true;
+        for (int i = 0; i < 180 && xQueueReceive(distance_queue, &distance, 0) == pdTRUE && xQueueReceive(servo_angle_queue, &angle, 0) == pdTRUE; i++)
         {
-            char msg[50];
-            snprintf(msg, 50, "%d", angle);
-            MQTT.publish(TOPIC_PUBLISH_ANGLE, msg);
-            vTaskDelay(50 / portTICK_PERIOD_MS); // Small delay to prevent flooding
+            char reading[50];
+            if (!first)
+            {
+                strcat(json_payload, ",");
+            }
+            snprintf(reading, 50, "{\"angle\":%d,\"dist\":%.2f}", angle, distance);
+            strcat(json_payload, reading);
+            first = false;
         }
-        MQTT.publish(TOPIC_PUBLISH_ANGLE, "end");
+        strcat(json_payload, "]}");
+
+        // Publique UMA ÚNICA VEZ com todos os dados
+        MQTT.publish(TOPIC_PUBLISH_DISTANCE, json_payload);
+
+        // MQTT.publish(TOPIC_PUBLISH_ANGLE, "start");
+
+        // for (int i = 0; i < 180 && xQueueReceive(servo_angle_queue, &angle, 0) == pdTRUE; i++) // Timeout 0 = non-blocking
+        // {
+        //     char msg[50];
+        //     snprintf(msg, 50, "%d", angle);
+        //     MQTT.publish(TOPIC_PUBLISH_ANGLE, msg);
+        //     vTaskDelay(50 / portTICK_PERIOD_MS); // Small delay to prevent flooding
+        // }
+        // MQTT.publish(TOPIC_PUBLISH_ANGLE, "end");
 
         xSemaphoreGive(done_MQTT);
 
