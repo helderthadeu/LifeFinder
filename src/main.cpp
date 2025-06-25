@@ -1,10 +1,10 @@
 // Base library:
 #include <Arduino.h>
 #include <vector>
+#include <queue>
 
 // Sensors libraries
 #include "DHT.h"
-#include <queue>
 #include <ESP32Servo.h>
 #include <Ultrasonic.h>
 
@@ -13,6 +13,9 @@
 #include <PubSubClient.h>
 
 // Pins definition
+#define connected_led 32
+#define send_led 33
+
 #define trigPin 13
 #define echoPin 12
 Ultrasonic ultrasonic(trigPin, echoPin, 20000UL);
@@ -23,17 +26,16 @@ DHT dht(DHTPIN, DHT11);
 #define SERVO_PIN 27
 
 Servo servo;
-// #define OT1_PIN 32
-// #define OT2_PIN 33
 
 // MQTT configuration
 
 #define ID_MQTT "Lifefinder"
-#define TOPIC_PUBLISH_DISTANCE "topic_distance"
-#define TOPIC_PUBLISH_ANGLE "topic_angle"
+#define TOPIC_PUBLISH_DISTANCE "topic_data"
 
 const char *SSID = "CAM2-4";       // SSID / name of the Wi-Fi network to connect to
 const char *PASSWORD = "33754367"; // Password of the Wi-Fi network to connect to
+// const char *SSID = "Helderwifi";       // SSID / name of the Wi-Fi network to connect to
+// const char *PASSWORD = "thadeu12"; // Password of the Wi-Fi network to connect to
 
 const char *BROKER_MQTT = "test.mosquitto.org";
 int BROKER_PORT = 1883; // MQTT Broker port
@@ -49,10 +51,16 @@ struct Presence_sensor
     bool presence;
 };
 
+// Que declarations
 QueueHandle_t presence_queue;
 QueueHandle_t humidity_queue;
 QueueHandle_t distance_queue;
 QueueHandle_t servo_angle_queue;
+
+
+// Semaphore declarations
+SemaphoreHandle_t start_humidity = xSemaphoreCreateBinary();
+SemaphoreHandle_t start_smoke = xSemaphoreCreateBinary();
 
 SemaphoreHandle_t start_scan = xSemaphoreCreateBinary();
 SemaphoreHandle_t start_distance_measurement = xSemaphoreCreateBinary();
@@ -63,14 +71,12 @@ SemaphoreHandle_t done_distance = xSemaphoreCreateBinary();
 SemaphoreHandle_t done_servo = xSemaphoreCreateBinary();
 SemaphoreHandle_t done_MQTT = xSemaphoreCreateBinary();
 
-// xSemaphoreGive(send_mqtt); // Inicializa liberado
-
 SemaphoreHandle_t serial_mutex = xSemaphoreCreateMutex();
 
 // Function declarations
 void process_data(void *parameters);
 void measure_distance(void *ultrassonic_parameters);
-void scan_presence(void *parameters);
+void scan_smoke(void *parameters);
 void scan_humidity(void *dht_parameters);
 void servo_controller_task(void *controller);
 void VerificaConexoesWiFIEMQTT(void);
@@ -95,9 +101,9 @@ void process_data(void *parameters)
     float total_humidity = 0;
     const float MAX_HUMIDITY_VALUES = 50;
     queue<float> humidity_values;
-    xSemaphoreTake(serial_mutex, portMAX_DELAY);
-    Serial.println("------Process Data Task Started------");
-    xSemaphoreGive(serial_mutex);
+    // xSemaphoreTake(serial_mutex, portMAX_DELAY);
+    // Serial.println("------Process Data Task Started------");
+    // xSemaphoreGive(serial_mutex);
     for (;;)
     {
 
@@ -133,25 +139,23 @@ void process_data(void *parameters)
                 xSemaphoreGive(start_scan);
                 xSemaphoreGive(start_distance_measurement);
 
-                vTaskDelay(9000 / portTICK_PERIOD_MS);
-                xSemaphoreGive(send_mqtt);
                 xSemaphoreTake(done_distance, portMAX_DELAY);
                 xSemaphoreTake(done_servo, portMAX_DELAY);
+                vTaskDelay(1000 / portTICK_PERIOD_MS);
+                xSemaphoreGive(send_mqtt);
+                xSemaphoreTake(done_MQTT, portMAX_DELAY);
 
                 xSemaphoreTake(start_scan, 0);
                 xSemaphoreTake(start_distance_measurement, 0);
                 xSemaphoreTake(send_mqtt, 0);
 
                 total_humidity = 0;
-                // while (!humidity_values.empty())
-                // {
-                //     humidity_values.pop();
-                // }
-                // vTaskDelay(500 / portTICK_PERIOD_MS);
             }
-
-            total_humidity -= humidity_values.front();
-            humidity_values.pop();
+            else
+            {
+                total_humidity -= humidity_values.front();
+                humidity_values.pop();
+            }
         }
         vTaskDelay(50 / portTICK_PERIOD_MS); // Waits 1 second before checking again
         xSemaphoreGive(mqtt_connecting);
@@ -165,7 +169,6 @@ void process_data(void *parameters)
  */
 void measure_distance(void *ultrassonic_parameters)
 {
-    // Ultrasonic *ultrasonic = (Ultrasonic *)ultrassonic_parameters;
     vTaskDelay(3000 / portTICK_PERIOD_MS);
     for (;;)
     {
@@ -176,9 +179,10 @@ void measure_distance(void *ultrassonic_parameters)
         xSemaphoreGive(serial_mutex);
         for (int i = 0; i < 180; i++)
         {
+
             float distance = ultrasonic.read();
             xQueueSend(distance_queue, &distance, 0);
-            vTaskDelay(50 / portTICK_PERIOD_MS);
+            vTaskDelay(100 / portTICK_PERIOD_MS);
         }
         xSemaphoreTake(serial_mutex, portMAX_DELAY);
         Serial.println("------  Distance measured ------");
@@ -209,54 +213,14 @@ void servo_controller_task(void *controller)
             // xSemaphoreTake(serial_mutex, portMAX_DELAY);
             // Serial.printf("Degrees: %d\n", posDegrees);
             // xSemaphoreGive(serial_mutex);
-            xQueueSend(servo_angle_queue, &posDegrees, 0);
             servo.write(posDegrees);
-            vTaskDelay(50 / portTICK_PERIOD_MS);
+            xQueueSend(servo_angle_queue, &posDegrees, 0);
+            vTaskDelay(100 / portTICK_PERIOD_MS);
         }
         // xSemaphoreGive(start_scan);
         xSemaphoreGive(done_servo);
 
         vTaskDelay(3000 / portTICK_PERIOD_MS);
-    }
-}
-
-/**
- * @brief Scans for presence using serial data and sends results to a queue.
- * @param parameters Pointer to task parameters (unused).
- * @return None
- */
-void scan_presence(void *parameters)
-{
-    Presence_sensor sensor_data;
-    for (;;)
-    {
-        if (Serial2.available())
-        {
-            uint8_t header = Serial2.read();
-
-            // Checks if it is the start of a packet (pattern: 0xAA 0x00 ...)
-            if (header == 0xAA && Serial2.peek() == 0x00)
-            {
-                vTaskDelay(100 / portTICK_PERIOD_MS);
-                uint8_t packet[20];
-                packet[0] = header;
-                for (int i = 1; i < 20 && Serial2.available(); i++)
-                {
-                    packet[i] = Serial2.read();
-                }
-
-                // Presence detected?
-                bool presence = packet[8] > 0;
-                uint16_t distance = packet[9]; // distance in decimeters (~10 cm)
-
-                float distance_m = distance / 20.0;
-
-                sensor_data.presence = presence;
-                sensor_data.distance = distance_m;
-                xQueueSend(presence_queue, &sensor_data, 0);
-            }
-        }
-        vTaskDelay(1000 / portTICK_PERIOD_MS); // Waits 1 second before checking again
     }
 }
 
@@ -271,23 +235,22 @@ void scan_humidity(void *dht_parameters)
     float humidity = 0;
     for (;;)
     {
+        xSemaphoreTake(start_humidity, portMAX_DELAY);
+        xSemaphoreGive(start_humidity);
+
         humidity = dht.readHumidity();
         // xSemaphoreTake(serial_mutex, portMAX_DELAY);
         // Serial.print("Humidity: ");
         // Serial.println(humidity);
         // xSemaphoreGive(serial_mutex);
-        if (isnan(humidity))
+        if (!isnan(humidity))
         {
-            xSemaphoreTake(serial_mutex, portMAX_DELAY);
-            Serial.println("Failed to read humidity from DHT sensor!");
-            xSemaphoreGive(serial_mutex);
+            xQueueSend(humidity_queue, &humidity, 0);
         }
         else
         {
-            xQueueSend(humidity_queue, &humidity, 0);
             // xSemaphoreTake(serial_mutex, portMAX_DELAY);
-            // Serial.print("Humidity read successfully:");
-            // Serial.println(humidity);
+            // Serial.println("Failed to read humidity from DHT sensor!");
             // xSemaphoreGive(serial_mutex);
         }
 
@@ -314,7 +277,20 @@ void VerificaConexoesWiFIEMQTT(void)
  */
 void mqtt_task(void *parameters)
 {
-    
+    const int JSON_BUFFER_SIZE = 5000;
+
+    char *json_payload = (char *)malloc(JSON_BUFFER_SIZE);
+
+    if (json_payload == NULL)
+    {
+        xSemaphoreTake(serial_mutex, portMAX_DELAY);
+        Serial.println("ERRO FATAL: Falha ao alocar memória para o payload MQTT!");
+        xSemaphoreGive(serial_mutex);
+        while (1)
+        {
+            vTaskDelay(1000);
+        }
+    }
 
     for (;;)
     {
@@ -327,42 +303,70 @@ void mqtt_task(void *parameters)
         Serial.println("------ Send to MQTT ------");
         xSemaphoreGive(serial_mutex);
 
-        char json_payload[2048]; // Aumente o tamanho se necessário
-        strcpy(json_payload, "{\"readings\":[");
+        char *p = json_payload;
 
-        float distance = 0;
-        int angle = 0;
-        bool first = true;
-        for (int i = 0; i < 180 && xQueueReceive(distance_queue, &distance, 0) == pdTRUE && xQueueReceive(servo_angle_queue, &angle, 0) == pdTRUE; i++)
+        char *end = json_payload + JSON_BUFFER_SIZE;
+
+        p += snprintf(p, end - p, "{\"readings\":[");
+
+        float distance;
+        int angle;
+        bool first_element = true;
+
+        while (xQueueReceive(distance_queue, &distance, 0) == pdTRUE && xQueueReceive(servo_angle_queue, &angle, 0) == pdTRUE)
         {
-            char reading[50];
-            if (!first)
+
+            int written = 0;
+
+            if (!first_element)
             {
-                strcat(json_payload, ",");
+                written = snprintf(p, end - p, ",");
+
+                if (written > 0 && p + written < end)
+                {
+                    p += written;
+                }
+                else
+                {
+                    xSemaphoreTake(serial_mutex, portMAX_DELAY);
+                    Serial.println("ERRO: Perigo de estouro de buffer do JSON (na virgula). Payload truncado.");
+                    xSemaphoreGive(serial_mutex);
+                    break;
+                }
             }
-            snprintf(reading, 50, "{\"angle\":%d,\"dist\":%.2f}", angle, distance);
-            strcat(json_payload, reading);
-            first = false;
+
+            written = snprintf(p, end - p, "{\"a\":%d,\"d\":%.2f}", angle, distance);
+
+            if (written > 0 && p + written < end)
+            {
+                p += written;
+            }
+            else
+            {
+                xSemaphoreTake(serial_mutex, portMAX_DELAY);
+                Serial.println("ERRO: Perigo de estouro de buffer do JSON (no dado). Payload truncado.");
+                xSemaphoreGive(serial_mutex);
+                break;
+            }
+
+            first_element = false;
         }
-        strcat(json_payload, "]}");
 
-        // Publique UMA ÚNICA VEZ com todos os dados
-        MQTT.publish(TOPIC_PUBLISH_DISTANCE, json_payload);
+        snprintf(p, end - p, "]}");
 
-        // MQTT.publish(TOPIC_PUBLISH_ANGLE, "start");
-
-        // for (int i = 0; i < 180 && xQueueReceive(servo_angle_queue, &angle, 0) == pdTRUE; i++) // Timeout 0 = non-blocking
-        // {
-        //     char msg[50];
-        //     snprintf(msg, 50, "%d", angle);
-        //     MQTT.publish(TOPIC_PUBLISH_ANGLE, msg);
-        //     vTaskDelay(50 / portTICK_PERIOD_MS); // Small delay to prevent flooding
-        // }
-        // MQTT.publish(TOPIC_PUBLISH_ANGLE, "end");
+        if (MQTT.publish(TOPIC_PUBLISH_DISTANCE, json_payload))
+        {
+            digitalWrite(send_led, HIGH);
+            xSemaphoreTake(serial_mutex, portMAX_DELAY);
+            Serial.println("Payload JSON publicado com sucesso!");
+            xSemaphoreGive(serial_mutex);
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            digitalWrite(send_led, LOW);
+        }
 
         xSemaphoreGive(done_MQTT);
 
-        vTaskDelay(100 / portTICK_PERIOD_MS); // Main task delay
+        vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
 
@@ -372,6 +376,8 @@ void mqtt_task(void *parameters)
  */
 void initWiFi(void)
 {
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
 
     xSemaphoreTake(serial_mutex, portMAX_DELAY);
     Serial.println("------Wi-Fi Connection------");
@@ -391,6 +397,7 @@ void initMQTT(void)
 {
     MQTT.setServer(BROKER_MQTT, BROKER_PORT); // sets which broker and port to connect to
     MQTT.setCallback(mqtt_callback);          // sets callback function (called when any information from subscribed topics arrives)
+    MQTT.setBufferSize(4096);
     MQTT.setKeepAlive(60);
 }
 
@@ -400,32 +407,37 @@ void initMQTT(void)
  */
 void reconnectMQTT(void)
 {
+    xSemaphoreTake(start_humidity, 0);
+    xSemaphoreTake(start_smoke, 0);
+    xSemaphoreTake(mqtt_connecting, portMAX_DELAY);
     while (!MQTT.connected())
     {
         xQueueReset(distance_queue);
         xQueueReset(servo_angle_queue);
-        xSemaphoreTake(mqtt_connecting, portMAX_DELAY);
         xSemaphoreTake(serial_mutex, portMAX_DELAY);
         Serial.print("* Trying to connect to MQTT Broker: ");
         xSemaphoreGive(serial_mutex);
         Serial.println(BROKER_MQTT);
         if (MQTT.connect(ID_MQTT))
         {
+            digitalWrite(connected_led, HIGH);
             xSemaphoreTake(serial_mutex, portMAX_DELAY);
             Serial.println("Successfully connected to MQTT broker!");
             xSemaphoreGive(serial_mutex);
             xSemaphoreGive(mqtt_connecting);
             MQTT.subscribe(TOPIC_PUBLISH_DISTANCE);
-            MQTT.subscribe(TOPIC_PUBLISH_ANGLE);
+            xSemaphoreGive(start_humidity);
+            xSemaphoreGive(start_smoke);
         }
         else
         {
+            digitalWrite(connected_led, LOW);
             xSemaphoreTake(serial_mutex, portMAX_DELAY);
             Serial.print("Failed to reconnect to broker. ERROR: ");
             Serial.println(MQTT.state());
             Serial.println("There will be a new connection attempt in 2s");
             xSemaphoreGive(serial_mutex);
-            delay(2000);
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
         }
     }
 }
@@ -438,6 +450,7 @@ void reconnectWiFi(void)
 {
     // if already connected to the Wi-Fi network, do nothing.
     // Otherwise, attempts to connect
+    // xSemaphoreTake(start_humidity, portMAX_DELAY);
     if (WiFi.status() == WL_CONNECTED)
         return;
 
@@ -492,20 +505,25 @@ void setup()
 
     xSemaphoreGive(start_scan);                 // Inicializa liberado
     xSemaphoreGive(start_distance_measurement); // Inicializa liberado
-    // xSemaphoreGive(send_mqtt);                  // Inicializa liberado
-    xSemaphoreGive(serial_mutex);    // Inicializa liberado
-    xSemaphoreGive(mqtt_connecting); // Inicializa liberado
+    xSemaphoreGive(serial_mutex);               // Inicializa liberado
+    xSemaphoreGive(mqtt_connecting);            // Inicializa liberado
+    xSemaphoreGive(start_humidity);
 
     Serial.begin(115200);
-
-    // pinMode(OT1_PIN, INPUT_PULLDOWN);
-    // pinMode(OT2_PIN, INPUT_PULLDOWN);
 
     pinMode(DHTPIN, INPUT_PULLUP);
     dht.begin();
 
-    servo.attach(SERVO_PIN);
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+    ESP32PWM::allocateTimer(2);
+    ESP32PWM::allocateTimer(3);
+    servo.setPeriodHertz(50);
+    servo.attach(SERVO_PIN, 500, 2400);
     servo.write(0);
+
+    pinMode(connected_led, OUTPUT);
+    pinMode(send_led, OUTPUT);
 
     humidity_queue = xQueueCreate(1, sizeof(float));
     presence_queue = xQueueCreate(10, sizeof(Presence_sensor));
@@ -520,12 +538,11 @@ void setup()
     }
 
     // Wait for the serial monitor to open
-    xTaskCreate(mqtt_task, "MQTTLoop", 4096, NULL, 3, NULL);
+    xTaskCreate(mqtt_task, "MQTTLoop", 8192, NULL, 3, NULL);
     xTaskCreate(scan_humidity, "ScanHumidity", 4096, NULL, 1, NULL);
     xTaskCreate(process_data, "ProcessData", 4096, NULL, 4, NULL);
     xTaskCreate(measure_distance, "MeasureDistance", 4096, NULL, 2, NULL);
     xTaskCreate(servo_controller_task, "ServoController", 2048, NULL, 2, NULL);
-    // xTaskCreate(scan_presence, "ScanPresence", 2048, NULL, 1, NULL);
 }
 
 /**
